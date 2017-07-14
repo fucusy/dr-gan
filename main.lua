@@ -60,54 +60,130 @@ local fake_label = 0
 
 local SpatialBatchNormalization = nn.SpatialBatchNormalization
 local SpatialConvolution = nn.SpatialConvolution
+if gpu then
+    SpatialConvolution = nn.SpatialConvolutionMM
+end
 local SpatialFullConvolution = nn.SpatialFullConvolution
 
+local gpu = true
+
+-- 000, 018, 036, ... 180
+-- base CASIA gait database
+local pose_dim = 11 
+local noise_dim = 50
+local id_dim = 60
+
 local netG = nn.Sequential()
--- input is Z, going into a convolution
-netG:add(SpatialFullConvolution(nz, ngf * 8, 4, 4))
--- do not understand SpatialFullConvolution
+local fx = nn.Sequential()
+-- input is 1x96x96, going into a convolution
 
-netG:add(SpatialBatchNormalization(ngf * 8)):add(nn.ReLU(true))
--- state size: (ngf*8) x 4 x 4
-netG:add(SpatialFullConvolution(ngf * 8, ngf * 4, 4, 4, 2, 2, 1, 1))
-netG:add(SpatialBatchNormalization(ngf * 4)):add(nn.ReLU(true))
--- state size: (ngf*4) x 8 x 8
-netG:add(SpatialFullConvolution(ngf * 4, ngf * 2, 4, 4, 2, 2, 1, 1))
-netG:add(SpatialBatchNormalization(ngf * 2)):add(nn.ReLU(true))
--- state size: (ngf*2) x 16 x 16
-netG:add(SpatialFullConvolution(ngf * 2, ngf, 4, 4, 2, 2, 1, 1))
-netG:add(SpatialBatchNormalization(ngf)):add(nn.ReLU(true))
--- state size: (ngf) x 32 x 32
-netG:add(SpatialFullConvolution(ngf, nc, 4, 4, 2, 2, 1, 1))
-netG:add(nn.Tanh())
--- state size: (nc) x 64 x 64
+local input_channel = 1
+conv_kernel = {32, 64, 64, 64, 128, 128, 96, 192, 192, 128, 256, 256, 160, 320}
+conv_size = 3
+padding_size = 1
+conv_tride = {1, 1, 2, 1, 1, 2, 1, 1, 2, 1, 1, 2, 1, 1}
 
-netG:apply(weights_init)
+fx:add(SpatialConvolution(input_channel, conv_kernel[1], conv_size
+        , conv_size, conv_tride[1], conv_tride[1], padding_size, padding_size))
+fx:add(SpatialBatchNormalization( conv_kernel[1] )):add(nn.ELU(true))
+
+for i=2, #conv_kernel do
+    fx:add(SpatialConvolution(conv_kernel[i-1], conv_kernel[i], conv_size
+            , conv_size, conv_tride[i], conv_tride[i], padding_size, padding_size))
+    fx:add(SpatialBatchNormalization( conv_kernel[i] )):add(nn.ELU(true))
+end
+-- output {batchsize}*6*6*320
+
+fx:add(nn.SpatialAveragePooling(6, 6))
+-- output {batchsize}*1*1*320, this is f(x)
+
+fx:add(nn.Reshape(1, 320))
+
+-- input dim of G_decoder is 320 + noise dim + pose dim
+local G_decoder_dim = 320 + noise_dim + pose_dim
+
+-- input = torch.randn(32, 381, 1, 1)
+-- G_decoder:forward(input)
+
+local G_decoder = nn.Sequential()
+G_decoder:add(SpatialFullConvolution(G_decoder_dim, 320, 6, 6))
+-- output 6*6*320
+netG:add(SpatialBatchNormalization(320)):add(nn.ReLU(true))
+
+for i = #conv_kernel - 1, 1, -1 do
+    if conv_tride[i] == 1 then
+        G_decoder:add(SpatialFullConvolution(
+            conv_kernel[i+1], conv_kernel[i], conv_size, conv_size, 1, 1, 1, 1))
+        -- output 6*6*160
+    else
+        G_decoder:add(SpatialFullConvolution(
+            conv_kernel[i+1], conv_kernel[i], conv_size, conv_size, 2, 2, 1, 1,
+            1, 1))
+    end
+    netG:add(SpatialBatchNormalization(conv_kernel[i])):add(nn.ReLU(true))
+end
+
+G_decoder:add(SpatialFullConvolution(32, 1, 3, 3, 1, 1, 1, 1))
+-- output 96*96*1
+
+G_decoder:add(nn.Tanh())
+
+local netG = nn.Sequential()
+
+-- first is X, second pose, then noise
+local para_input_G = nn.ParallelTable()
+para_input_G:add(fx)
+para_input_G:add(nn.Identity())
+para_input_G:add(nn.Identity())
+
+netG:add(para_input_G)
+netG:add(nn.JoinTable(2))
+netG:add(nn.Reshape(G_decoder_dim, 1, 1))
+netG:add(G_decoder)
+
+local D = nn.Sequential()
+D:add(SpatialConvolution(input_channel, conv_kernel[1], conv_size
+        , conv_size, conv_tride[1], conv_tride[1], padding_size, padding_size))
+D:add(SpatialBatchNormalization( conv_kernel[1] )):add(nn.ELU(true))
+
+for i=2, #conv_kernel do
+    D:add(SpatialConvolution(conv_kernel[i-1], conv_kernel[i], conv_size
+            , conv_size, conv_tride[i], conv_tride[i], padding_size, padding_size))
+    D:add(SpatialBatchNormalization( conv_kernel[i] )):add(nn.ELU(true))
+end
+-- output {batchsize}*6*6*320
+
+D:add(nn.SpatialAveragePooling(6, 6))
+-- output {batchsize}*1*1*320, this is f(x)
+
+D:add(nn.Reshape(1, 320))
+
+local duplicate = nn.ConcatTable()
+duplicate:add(nn.Identity())
+duplicate:add(nn.Identity())
+
+local id_layer = nn.Sequential()
+id_layer:add(nn.Linear(320, id_dim))
+id_layer:add(nn.LogSoftMax())
+
+local pose_layer = nn.Sequential()
+pose_layer:add(nn.Linear(320, pose_dim))
+pose_layer:add(nn.LogSoftMax())
+
+local para = nn.ParallelTable()
+para:add(id_layer)
+para:add(pose_layer)
 
 local netD = nn.Sequential()
-
--- input is (nc) x 64 x 64
-netD:add(SpatialConvolution(nc, ndf, 4, 4, 2, 2, 1, 1))
-netD:add(nn.LeakyReLU(0.2, true))
--- state size: (ndf) x 32 x 32
-netD:add(SpatialConvolution(ndf, ndf * 2, 4, 4, 2, 2, 1, 1))
-netD:add(SpatialBatchNormalization(ndf * 2)):add(nn.LeakyReLU(0.2, true))
--- state size: (ndf*2) x 16 x 16
-netD:add(SpatialConvolution(ndf * 2, ndf * 4, 4, 4, 2, 2, 1, 1))
-netD:add(SpatialBatchNormalization(ndf * 4)):add(nn.LeakyReLU(0.2, true))
--- state size: (ndf*4) x 8 x 8
-netD:add(SpatialConvolution(ndf * 4, ndf * 8, 4, 4, 2, 2, 1, 1))
-netD:add(SpatialBatchNormalization(ndf * 8)):add(nn.LeakyReLU(0.2, true))
--- state size: (ndf*8) x 4 x 4
-netD:add(SpatialConvolution(ndf * 8, 1, 4, 4))
-netD:add(nn.Sigmoid())
--- state size: 1 x 1 x 1
-netD:add(nn.View(1):setNumInputDims(3))
--- state size: 1
-
-netD:apply(weights_init)
+netD:add(D)
+netD:add(duplicate)
+netD:add(para)
 
 local criterion = nn.BCECriterion()
+local crit = nn.SuperCriterion()
+crit:add(nn.ClassNLLCriterion(), 1)
+crit:add(nn.ClassNLLCriterion(), 1)
+
 ---------------------------------------------------------------------------
 optimStateG = {
    learningRate = opt.lr,
@@ -118,9 +194,11 @@ optimStateD = {
    beta1 = opt.beta1,
 }
 ----------------------------------------------------------------------------
-local input = torch.Tensor(opt.batchSize, 3, opt.fineSize, opt.fineSize)
-local noise = torch.Tensor(opt.batchSize, nz, 1, 1)
-local label = torch.Tensor(opt.batchSize)
+local input = torch.Tensor(opt.batchSize, 3, 96, 96)
+local noise = torch.Tensor(opt.batchSize, 1, noise_dim)
+local label = torch.Tensor(opt.batchSize, 1, id_dim)
+local pose = torch.Tensor(opt.batchSize, 1, pose_dim)
+
 local errD, errG
 local epoch_tm = torch.Timer()
 local tm = torch.Timer()
@@ -130,6 +208,7 @@ if opt.gpu > 0 then
    require 'cunn'
    cutorch.setDevice(opt.gpu)
    input = input:cuda();  noise = noise:cuda();  label = label:cuda()
+   pose = poes:cuda()
 
    if pcall(require, 'cudnn') then
       require 'cudnn'
@@ -164,8 +243,8 @@ local fDx = function(x)
    label:fill(real_label)
 
    local output = netD:forward(input)
-   local errD_real = criterion:forward(output, label)
-   local df_do = criterion:backward(output, label)
+   local errD_real = criterion:forward(output, {label, pose})
+   local df_do = criterion:backward(output, {label, pose})
    netD:backward(input, df_do)
 
    -- train with fake
@@ -174,13 +253,13 @@ local fDx = function(x)
    elseif opt.noise == 'normal' then
        noise:normal(0, 1)
    end
-   local fake = netG:forward(noise)
+   local fake = netG:forward({input, pose, noise})
    input:copy(fake)
    label:fill(fake_label)
 
    local output = netD:forward(input)
-   local errD_fake = criterion:forward(output, label)
-   local df_do = criterion:backward(output, label)
+   local errD_fake = criterion:forward(output, {label, pose})
+   local df_do = criterion:backward(output, {label, pos})
    netD:backward(input, df_do)
 
    errD = errD_real + errD_fake
